@@ -178,7 +178,88 @@ class P2PAgent:
                 self.message_buffer.append((peer_id, message))
                 raise ConnectionError(f"Failed to send message to {peer_id}")
 
-    # Rest of the class implementation remains the same...
+    def register_handler(self, message_type: str, handler: Callable):
+        """Register a handler function for a specific message type"""
+        self.message_handlers[message_type] = handler
+
+    async def _handle_connection(self, websocket, path):
+        """Handle incoming WebSocket connections and messages"""
+        try:
+            # Receive initial handshake
+            handshake = await websocket.recv()
+            handshake_data = json.loads(handshake)
+            
+            # Verify signature
+            peer_verify_key = ed25519.Ed25519PublicKey.from_public_bytes(
+                bytes.fromhex(handshake_data["verify_key"])
+            )
+            
+            # Remove signature for verification
+            sig = bytes.fromhex(handshake_data.pop("signature"))
+            peer_verify_key.verify(sig, json.dumps(handshake_data).encode())
+            
+            # Extract peer information
+            peer_id = handshake_data["agent_id"]
+            peer_kyber_key = bytes.fromhex(handshake_data["kyber_public_key"])
+            
+            # Perform Kyber key encapsulation
+            shared_secret = self.kyber.encapsulate(peer_kyber_key)
+            session_key = self.derive_session_key(shared_secret, peer_id)
+            self.session_keys[peer_id] = session_key
+            
+            # Send response handshake
+            response = {
+                "type": "handshake",
+                "agent_id": self.agent_id,
+                "kyber_public_key": self.kyber_public_key.hex(),
+                "verify_key": self.verify_key.public_bytes().hex()
+            }
+            
+            # Sign the response
+            signature = self.signing_key.sign(json.dumps(response).encode())
+            response["signature"] = signature.hex()
+            
+            await websocket.send(json.dumps(response))
+            
+            # Handle incoming messages
+            async for message in websocket:
+                try:
+                    message_data = json.loads(message)
+                    
+                    # Verify message signature
+                    if peer_id != message_data["sender"]:
+                        raise ValueError("Message sender mismatch")
+                        
+                    sig = bytes.fromhex(message_data.pop("signature"))
+                    peer_verify_key.verify(sig, json.dumps(message_data).encode())
+                    
+                    # Decrypt message
+                    nonce = bytes.fromhex(message_data["nonce"])
+                    cipher = ChaCha20Poly1305(self.session_keys[peer_id])
+                    decrypted_message = cipher.decrypt(
+                        nonce,
+                        bytes.fromhex(message_data["payload"]),
+                        peer_id.encode()
+                    )
+                    
+                    # Parse and handle message
+                    message_content = json.loads(decrypted_message.decode())
+                    message_type = message_content.get("type")
+                    
+                    if message_type in self.message_handlers:
+                        await self.message_handlers[message_type](message_content)
+                    
+                    # Send acknowledgment
+                    await websocket.send(json.dumps({"status": "received"}))
+                    
+                except Exception as e:
+                    print(f"Error handling message: {e}")
+                    await websocket.send(json.dumps({"status": "error", "message": str(e)}))
+                    
+        except Exception as e:
+            print(f"Connection error: {e}")
+            if not websocket.closed:
+                await websocket.close()
 
 # Helper function to generate self-signed certificates for testing
 def generate_self_signed_cert(cert_path: str, key_path: str):
@@ -231,6 +312,7 @@ def generate_self_signed_cert(cert_path: str, key_path: str):
 
 # Example usage
 async def main():
+    """Example of how to use the P2PAgent class"""
     # Generate certificates first
     cert_path = "cert.pem"
     key_path = "key.pem"
@@ -241,26 +323,42 @@ async def main():
     agent2 = P2PAgent("agent2", 8002, cert_path, key_path)
     
     # Start their secure servers
-    await asyncio.gather(
+    server_tasks = asyncio.gather(
         agent1.start(),
         agent2.start()
     )
     
-    # Connect them using wss://
-    await agent1.connect_to_peer("agent2", "wss://localhost:8002")
+    # Give servers time to start
+    await asyncio.sleep(1)
     
-    # Define message handlers
-    async def handle_query(message):
-        print(f"Received query: {message}")
+    try:
+        # Connect them using wss://
+        await agent1.connect_to_peer("agent2", "wss://localhost:8002")
         
-    agent1.register_handler("query", handle_query)
-    agent2.register_handler("query", handle_query)
-    
-    # Send test message
-    await agent1.send_message("agent2", {
-        "type": "query",
-        "content": "Hello from agent1!"
-    })
+        # Define message handlers
+        async def handle_query(message):
+            print(f"Received query: {message}")
+            
+        agent1.register_handler("query", handle_query)
+        agent2.register_handler("query", handle_query)
+        
+        # Send test message
+        await agent1.send_message("agent2", {
+            "type": "query",
+            "content": "Hello from agent1!"
+        })
+        
+        # Keep the connection alive
+        await server_tasks
+        
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+    except Exception as e:
+        print(f"Error in main: {e}")
+    finally:
+        # Cleanup
+        for task in asyncio.all_tasks():
+            task.cancel()
 
 if __name__ == "__main__":
     asyncio.run(main())
